@@ -16,6 +16,7 @@ No Hermes imports here so it stays unit-testable in isolation.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime
 
@@ -28,6 +29,12 @@ __all__ = ["Attendee", "Event", "build_calendar", "parse_events"]
 
 TRANSP_BUSY = "OPAQUE"
 TRANSP_FREE = "TRANSPARENT"
+
+_MAILBOX_ATOM = r"[A-Za-z0-9!#$'*+\-=^_`{|}~]+"
+_MAILBOX_LABEL = r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?"
+_MAILBOX = re.compile(
+    rf"{_MAILBOX_ATOM}(?:\.{_MAILBOX_ATOM})*@{_MAILBOX_LABEL}(?:\.{_MAILBOX_LABEL})*"
+)
 
 
 @dataclass
@@ -77,6 +84,8 @@ def _unfold(text: str) -> list[str]:
 
 def _fold(line: str) -> str:
     """Fold a content line to <=75 octets, continuation lines prefixed with a space."""
+    if "\r" in line or "\n" in line:
+        raise ValueError("iCalendar content lines must not contain a line break.")
     encoded = line.encode("utf-8")
     if len(encoded) <= 75:
         return line
@@ -110,6 +119,7 @@ def _unescape(value: str) -> str:
 
 
 def _escape(value: str) -> str:
+    value = value.replace("\r\n", "\n").replace("\r", "\n")
     return value.replace("\\", "\\\\").replace("\n", "\\n").replace(",", "\\,").replace(";", "\\;")
 
 
@@ -148,8 +158,17 @@ def _parse_cal_address(value: str, params: dict[str, str]) -> Attendee:
     )
 
 
+def _validate_cal_address(attendee: Attendee) -> None:
+    values = (attendee.email, attendee.name, attendee.role, attendee.partstat)
+    if any("\r" in value or "\n" in value for value in values):
+        raise ValueError("Calendar addresses must not contain a line break.")
+    if _MAILBOX.fullmatch(attendee.email) is None:
+        raise ValueError(f"Invalid calendar email address: {attendee.email!r}.")
+
+
 def _format_cal_address(prop: str, attendee: Attendee) -> str:
     """Serialize an ATTENDEE/ORGANIZER content line."""
+    _validate_cal_address(attendee)
     parts = [prop]
     if attendee.name:
         parts.append(f"CN={_param_value(attendee.name)}")

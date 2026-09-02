@@ -235,7 +235,7 @@ def test_delete_bad_status():
         client.delete_event("/cal/x.ics")
 
 
-def test_url_accepts_absolute_and_relative(monkeypatch):
+def test_url_accepts_same_origin_absolute_and_relative():
     seen: list[str] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -243,10 +243,53 @@ def test_url_accepts_absolute_and_relative(monkeypatch):
         return httpx.Response(204)
 
     client = make_client(handler)
-    client.delete_event("https://other.example/full/path.ics")
+    client.delete_event("https://caldav.yandex.ru/full/path.ics")
     client.delete_event("relative/path.ics")
-    assert seen[0] == "https://other.example/full/path.ics"
+    assert seen[0] == "https://caldav.yandex.ru/full/path.ics"
     assert seen[1] == "https://caldav.yandex.ru/relative/path.ics"
+
+
+@pytest.mark.parametrize(
+    "event_href",
+    [
+        "https://attacker.example/collect",
+        "http://caldav.yandex.ru/calendars/user@yandex.ru/events-42/evt-1.ics",
+    ],
+)
+def test_event_href_rejects_cross_origin_or_insecure_url_before_request(event_href):
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(str(request.url))
+        return httpx.Response(404)
+
+    client = make_client(handler)
+    with pytest.raises(CalDAVError, match="HTTPS origin"):
+        client.get_event(event_href)
+    assert seen == []
+
+
+def test_client_rejects_insecure_base_url():
+    with pytest.raises(CalDAVError, match="HTTPS origin"):
+        YandexCalDAVClient("user@yandex.ru", "app-pw", base_url="http://caldav.yandex.ru")
+
+
+def test_same_origin_absolute_event_href_preserves_base_path():
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(str(request.url))
+        return httpx.Response(204)
+
+    http = httpx.Client(transport=httpx.MockTransport(handler))
+    client = YandexCalDAVClient(
+        "user@yandex.ru",
+        "app-pw",
+        base_url="https://calendar.example.test/caldav",
+        client=http,
+    )
+    client.delete_event("https://calendar.example.test/caldav/events/work.ics")
+    assert seen == ["https://calendar.example.test/caldav/events/work.ics"]
 
 
 def test_list_calendars_applies_allow_list():
@@ -294,6 +337,121 @@ def test_allow_list_forces_validation_of_explicit_ref():
     # Personal exists but is not allowed -> rejected
     with pytest.raises(CalDAVError, match="not found"):
         client.resolve_calendar_href("Personal")
+
+
+@pytest.mark.parametrize("operation", ["get", "update", "delete"])
+def test_allow_list_rejects_direct_event_operations_in_other_calendar(operation):
+    seen: list[tuple[str, str]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append((request.method, request.url.path))
+        if request.method == "PROPFIND":
+            return httpx.Response(207, text=TWO_CALENDARS)
+        return httpx.Response(204)
+
+    client = make_client(handler, allowed=["Work"])
+    private_href = "/calendars/user@yandex.ru/events-99/private.ics"
+    with pytest.raises(CalDAVError, match="not in an allowed calendar"):
+        if operation == "get":
+            client.get_event(private_href)
+        elif operation == "update":
+            client.update_event(Event(uid="private"), private_href)
+        else:
+            client.delete_event(private_href)
+
+    assert seen == [("PROPFIND", "/calendars/user@yandex.ru/")]
+
+
+def test_allow_list_accepts_direct_event_in_allowed_calendar():
+    seen: list[tuple[str, str]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append((request.method, request.url.path))
+        if request.method == "PROPFIND":
+            return httpx.Response(207, text=TWO_CALENDARS)
+        return httpx.Response(204)
+
+    client = make_client(handler, allowed=["Work"])
+    client.delete_event("/calendars/user@yandex.ru/events-42/work.ics")
+    assert seen == [
+        ("PROPFIND", "/calendars/user@yandex.ru/"),
+        ("DELETE", "/calendars/user@yandex.ru/events-42/work.ics"),
+    ]
+
+
+def test_allow_list_rejects_encoded_path_outside_allowed_collection():
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "PROPFIND":
+            return httpx.Response(207, text=TWO_CALENDARS)
+        return httpx.Response(204)
+
+    client = make_client(handler, allowed=["Work"])
+    with pytest.raises(CalDAVError, match="dot segment"):
+        client.delete_event(
+            "/calendars/user@yandex.ru/events-42/%252e%252e%252fevents-99%252fprivate.ics"
+        )
+
+
+def test_allow_list_rejects_malformed_percent_escape():
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "PROPFIND":
+            return httpx.Response(207, text=TWO_CALENDARS)
+        return httpx.Response(204)
+
+    client = make_client(handler, allowed=["Work"])
+    with pytest.raises(CalDAVError, match="percent escape"):
+        client.delete_event("/calendars/user@yandex.ru/events-42/bad%zz.ics")
+
+
+def test_event_operation_rejects_calendar_collection_before_request():
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request.method)
+        return httpx.Response(204)
+
+    client = make_client(handler, allowed=["Work"])
+    with pytest.raises(CalDAVError, match="event resource"):
+        client.delete_event("/calendars/user@yandex.ru/events-42/")
+    assert seen == []
+
+
+@pytest.mark.parametrize(
+    "event_href",
+    [
+        "/calendars/user@yandex.ru/events-42/\\..\\events-99\\private.ics",
+        "/calendars/user@yandex.ru/events-42/%5c..%5cevents-99%5cprivate.ics",
+        "/calendars/user@yandex.ru/events-42/%255c..%255cevents-99%255cprivate.ics",
+    ],
+)
+def test_allow_list_rejects_backslash_path_before_request(event_href):
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request.method)
+        return httpx.Response(204)
+
+    client = make_client(handler, allowed=["Work"])
+    with pytest.raises(CalDAVError, match="backslash"):
+        client.delete_event(event_href)
+    assert seen == []
+
+
+@pytest.mark.parametrize(
+    "suffix",
+    [".", "..", "%2e", "%2e%2e", "%252e", "%252e%252e"],
+)
+def test_event_operation_rejects_terminal_dot_segment_before_request(suffix):
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request.method)
+        return httpx.Response(204)
+
+    client = make_client(handler, allowed=["Work"])
+    with pytest.raises(CalDAVError, match="dot segment"):
+        client.delete_event(f"/calendars/user@yandex.ru/events-42/{suffix}")
+    assert seen == []
 
 
 def test_get_event_parses():

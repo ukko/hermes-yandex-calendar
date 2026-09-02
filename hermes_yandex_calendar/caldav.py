@@ -9,10 +9,11 @@ No Hermes imports — this is unit-testable with ``httpx.MockTransport``.
 
 from __future__ import annotations
 
+import re
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
-from urllib.parse import quote, urlsplit
+from urllib.parse import quote, unquote, urlsplit
 
 import httpx
 from defusedxml import ElementTree as DET
@@ -29,9 +30,60 @@ _PROPFIND_CALENDARS = (
     "<d:prop><d:resourcetype/><d:displayname/></d:prop></d:propfind>"
 )
 
+_INVALID_PERCENT_ESCAPE = re.compile(r"%(?![0-9A-Fa-f]{2})")
+
 
 class CalDAVError(RuntimeError):
     """Raised for transport or protocol failures. The tool layer converts these to JSON."""
+
+
+def _https_origin(url: str) -> tuple[str, int]:
+    """Return a canonical HTTPS origin, rejecting unsafe credential destinations."""
+    parsed = urlsplit(url)
+    try:
+        port = parsed.port
+    except ValueError as exc:
+        raise CalDAVError("CalDAV URLs must use the configured HTTPS origin.") from exc
+    if (
+        parsed.scheme.lower() != "https"
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise CalDAVError("CalDAV URLs must use the configured HTTPS origin.")
+    return parsed.hostname.lower(), port or 443
+
+
+def _decode_path(path: str) -> str:
+    """Fully decode a path so nested escapes cannot hide a collection change."""
+    if _INVALID_PERCENT_ESCAPE.search(path):
+        raise CalDAVError("event_href contains an invalid percent escape.")
+    decoded = path
+    while True:
+        try:
+            next_value = unquote(decoded, errors="strict")
+        except UnicodeDecodeError as exc:
+            raise CalDAVError("event_href contains an invalid percent escape.") from exc
+        if next_value == decoded:
+            if "\\" in decoded:
+                raise CalDAVError("event_href must not contain a backslash.")
+            return decoded
+        decoded = next_value
+
+
+def _event_paths(url: str) -> tuple[str, str]:
+    """Return raw and decoded event paths after rejecting collection aliases."""
+    parsed = urlsplit(url)
+    if parsed.query or parsed.fragment or not parsed.path:
+        raise CalDAVError("event_href must be a CalDAV resource path without query data.")
+    decoded_path = _decode_path(parsed.path)
+    if any(segment in {".", ".."} for segment in decoded_path.split("/")):
+        raise CalDAVError("event_href must not contain a dot segment.")
+    if decoded_path.endswith("/"):
+        raise CalDAVError("event_href must identify an event resource, not a collection.")
+    return parsed.path, decoded_path
 
 
 @dataclass
@@ -123,6 +175,7 @@ class YandexCalDAVClient:
     ) -> None:
         self.login = login
         self.base_url = base_url.rstrip("/")
+        self._origin = _https_origin(self.base_url)
         self._allowed_raw = list(allowed_calendars or [])
         self._allowed = {c.strip().lower() for c in self._allowed_raw if c.strip()}
         self._owns_client = client is None
@@ -151,8 +204,11 @@ class YandexCalDAVClient:
     # -- helpers ------------------------------------------------------------
 
     def _url(self, href: str) -> str:
-        """Resolve a href (absolute path or full URL) against the base URL."""
-        if href.startswith("http://") or href.startswith("https://"):
+        """Resolve an href without ever sending credentials to another origin."""
+        parsed = urlsplit(href)
+        if parsed.scheme or parsed.netloc:
+            if _https_origin(href) != self._origin:
+                raise CalDAVError("CalDAV URLs must use the configured HTTPS origin.")
             return href
         if not href.startswith("/"):
             href = "/" + href
@@ -174,6 +230,24 @@ class YandexCalDAVClient:
                 "YANDEX_CALENDAR_APP_PASSWORD; an app password is required)."
             )
         return resp
+
+    def _validate_event_href(self, event_href: str) -> str:
+        """Return an event path after origin and configured-calendar checks."""
+        if not event_href:
+            raise CalDAVError("event_href is required.")
+        resolved = self._url(event_href)
+        raw_path, decoded_path = _event_paths(resolved)
+        if not self._allowed:
+            return resolved
+
+        decoded_parent = decoded_path.rsplit("/", 1)[0].rstrip("/") + "/"
+        allowed_paths = {
+            _decode_path(urlsplit(calendar.href).path).rstrip("/") + "/"
+            for calendar in self.list_calendars()
+        }
+        if decoded_parent not in allowed_paths:
+            raise CalDAVError(f"Event {raw_path!r} is not in an allowed calendar.")
+        return resolved
 
     # -- discovery ----------------------------------------------------------
 
@@ -311,8 +385,7 @@ class YandexCalDAVClient:
 
     def _fetch_document(self, event_href: str) -> tuple[str, list[Event]] | None:
         """GET an event resource, returning its raw text and every VEVENT in it."""
-        if not event_href:
-            raise CalDAVError("event_href is required.")
+        event_href = self._validate_event_href(event_href)
         resp = self._request("GET", event_href)
         if resp.status_code == 404:
             return None
@@ -371,8 +444,7 @@ class YandexCalDAVClient:
 
     def update_event(self, event: Event, event_href: str) -> Event:
         """PUT a modified event back to its existing resource (overwrites in place)."""
-        if not event_href:
-            raise CalDAVError("event_href is required to update an event.")
+        event_href = self._validate_event_href(event_href)
         self._ensure_organizer(event)
         resp = self._request(
             "PUT",
@@ -443,8 +515,7 @@ class YandexCalDAVClient:
 
     def delete_event(self, event_href: str) -> None:
         """DELETE an event resource by its href (as returned by ``list_events``)."""
-        if not event_href:
-            raise CalDAVError("event_href is required to delete an event.")
+        event_href = self._validate_event_href(event_href)
         resp = self._request("DELETE", event_href)
         if resp.status_code not in (200, 204, 404):
             raise CalDAVError(f"Deleting event failed: HTTP {resp.status_code}")

@@ -34,8 +34,10 @@ hermes plugins install akinfold/hermes-yandex-calendar --enable
 
 # 2. Add your credentials — the app password comes from
 #    https://id.yandex.ru/security/app-passwords (scope: "Calendar (CalDAV)")
+umask 077
 printf 'YANDEX_CALENDAR_LOGIN=%s\nYANDEX_CALENDAR_APP_PASSWORD=%s\n' \
   'you@yandex.ru' 'your-app-password' >> ~/.hermes/.env
+chmod 600 ~/.hermes/.env
 ```
 
 Then enable it in `~/.hermes/config.yaml` (third-party plugins are off by default):
@@ -47,8 +49,9 @@ plugins:
 
 That's it. Ask the agent *"what do I have tomorrow?"* and it will tell you.
 
-> Not ready to hand over write access? Add `YANDEX_CALENDAR_ACTIONS=read` and it
-> can only look — see [Restricting what the agent can do](#restricting-what-the-agent-can-do).
+> The backward-compatible default exposes every action, including delete. For a
+> new or untrusted agent setup, start with `YANDEX_CALENDAR_ACTIONS=read` — see
+> [Security boundaries](#security-boundaries).
 
 ## The tools
 
@@ -84,7 +87,7 @@ first one in that list becomes the default.
 |---|---|---|---|
 | `YANDEX_CALENDAR_LOGIN` | yes | — | Yandex login / email. |
 | `YANDEX_CALENDAR_APP_PASSWORD` | yes | — | App password for CalDAV — an account password will not work. |
-| `YANDEX_CALENDAR_BASE_URL` | no | `https://caldav.yandex.ru` | Override for self-hosted / testing. |
+| `YANDEX_CALENDAR_BASE_URL` | no | `https://caldav.yandex.ru` | HTTPS override for self-hosted / testing. |
 | `YANDEX_CALENDAR_CALENDARS` | no | *(all)* | Comma-separated allow-list of calendar names, e.g. `Work,Personal`. The first is the default calendar. |
 | `YANDEX_CALENDAR_ACTIONS` | no | *(all)* | Comma-separated allow-list of actions the agent may perform — see below. |
 
@@ -127,6 +130,23 @@ Leave it unset for all seven tools. A name that matches nothing is ignored, so a
 typo can only ever withhold a tool, never grant one — and a value that names
 nothing recognisable therefore registers nothing at all. The list is applied when
 the plugin loads: restart Hermes after changing it.
+
+### Security boundaries
+
+- CalDAV credentials are sent only to the HTTPS origin configured by
+  `YANDEX_CALENDAR_BASE_URL`. Event hrefs pointing to HTTP or another origin are
+  rejected before a request is made.
+- `YANDEX_CALENDAR_CALENDARS` applies to both target calendars and direct event
+  operations (`update`, `respond`, `move`, and `delete`).
+- Calendar titles, descriptions, locations, and attendee names are untrusted input.
+  A capable agent can still act on misleading event content, so use `read` unless
+  the agent and every calendar writer are trusted.
+- The action allow-list limits the tools exposed to Hermes; it does not reduce the
+  privileges of the Yandex app password itself. Use a dedicated app password and,
+  for stronger isolation, a dedicated Yandex account.
+
+The default remains `all` for compatibility with existing installations. This is a
+trusted-agent mode, not the recommended starting point for a new deployment.
 
 ## Getting the app password
 
