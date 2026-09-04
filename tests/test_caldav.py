@@ -254,6 +254,11 @@ def test_url_accepts_same_origin_absolute_and_relative():
     [
         "https://attacker.example/collect",
         "http://caldav.yandex.ru/calendars/user@yandex.ru/events-42/evt-1.ics",
+        "https://caldav.yandex.ru:8443/cal/event.ics",
+        "https://caldav.yandex.ru:invalid/cal/event.ics",
+        "https://user:password@caldav.yandex.ru/cal/event.ics",
+        "//caldav.yandex.ru/cal/event.ics",
+        "https:///cal/event.ics",
     ],
 )
 def test_event_href_rejects_cross_origin_or_insecure_url_before_request(event_href):
@@ -272,6 +277,28 @@ def test_event_href_rejects_cross_origin_or_insecure_url_before_request(event_hr
 def test_client_rejects_insecure_base_url():
     with pytest.raises(CalDAVError, match="HTTPS origin"):
         YandexCalDAVClient("user@yandex.ru", "app-pw", base_url="http://caldav.yandex.ru")
+
+
+@pytest.mark.parametrize(
+    ("event_href", "message"),
+    [
+        ("/cal/event.ics?download=1", "without query data"),
+        ("/cal/event.ics#fragment", "without query data"),
+        ("https://caldav.yandex.ru", "without query data"),
+        ("/cal/%FF.ics", "percent escape"),
+    ],
+)
+def test_malformed_event_href_is_rejected_before_request(event_href, message):
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(str(request.url))
+        return httpx.Response(204)
+
+    client = make_client(handler)
+    with pytest.raises(CalDAVError, match=message):
+        client.delete_event(event_href)
+    assert seen == []
 
 
 def test_same_origin_absolute_event_href_preserves_base_path():
@@ -339,7 +366,7 @@ def test_allow_list_forces_validation_of_explicit_ref():
         client.resolve_calendar_href("Personal")
 
 
-@pytest.mark.parametrize("operation", ["get", "update", "delete"])
+@pytest.mark.parametrize("operation", ["get", "update", "delete", "respond", "move"])
 def test_allow_list_rejects_direct_event_operations_in_other_calendar(operation):
     seen: list[tuple[str, str]] = []
 
@@ -356,6 +383,10 @@ def test_allow_list_rejects_direct_event_operations_in_other_calendar(operation)
             client.get_event(private_href)
         elif operation == "update":
             client.update_event(Event(uid="private"), private_href)
+        elif operation == "respond":
+            client.respond_to_event(private_href, "ACCEPTED")
+        elif operation == "move":
+            client.move_event(private_href, "Work")
         else:
             client.delete_event(private_href)
 

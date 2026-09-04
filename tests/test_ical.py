@@ -193,6 +193,12 @@ def test_build_normalizes_text_line_breaks_before_escaping():
     assert "DESCRIPTION:first\\nsecond\\nthird\r\n" in ics
 
 
+def test_build_rejects_line_break_in_raw_property():
+    event = Event(uid="event", raw_props=["X-CUSTOM:value\r\nX-INJECTED:YES"])
+    with pytest.raises(ValueError, match="line break"):
+        build_calendar(event)
+
+
 def test_raw_props_are_preserved_on_roundtrip():
     text = (
         "BEGIN:VEVENT\r\n"

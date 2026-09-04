@@ -5,10 +5,11 @@ from __future__ import annotations
 import json
 from datetime import UTC, datetime
 
+import httpx
 import pytest
 
 from hermes_yandex_calendar import tool
-from hermes_yandex_calendar.caldav import CalDAVError
+from hermes_yandex_calendar.caldav import CalDAVError, YandexCalDAVClient
 from hermes_yandex_calendar.config import MissingCredentials
 from hermes_yandex_calendar.ical import Event
 
@@ -101,6 +102,39 @@ def test_list_returns_sorted_events(patch_client):
     out = json.loads(tool.handle_list({"start": "2026-07-25", "end": "2026-07-26"}))
     assert out["count"] == 2
     assert [e["summary"] for e in out["events"]] == ["Earlier", "Later"]
+
+
+@pytest.mark.parametrize(
+    ("handle", "args", "message"),
+    [
+        (tool.handle_delete, {"event_href": "https://attacker.example/event.ics"}, "HTTPS origin"),
+        (tool.handle_delete, {"event_href": "/cal/%FF.ics"}, "percent escape"),
+        (
+            tool.handle_create,
+            {
+                "summary": "Meeting",
+                "start": "2026-07-25",
+                "calendar": "/cal/",
+                "attendees": [{"email": "safe@example.com", "name": "Name\r\nX-INJECTED:YES"}],
+            },
+            "line break",
+        ),
+    ],
+)
+def test_validation_failures_return_json_without_network(patch_client, handle, args, message):
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request.method)
+        return httpx.Response(204)
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as http:
+        patch_client(YandexCalDAVClient("user@yandex.ru", "app-pw", client=http))
+        result = handle(args)
+
+    assert isinstance(result, str)
+    assert message in json.loads(result)["error"]
+    assert seen == []
 
 
 def test_list_defaults_range(patch_client):
