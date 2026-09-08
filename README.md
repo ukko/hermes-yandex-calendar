@@ -135,12 +135,18 @@ the plugin loads: restart Hermes after changing it.
 
 - CalDAV credentials are sent only to the HTTPS origin configured by
   `YANDEX_CALENDAR_BASE_URL`. Event hrefs pointing to HTTP or another origin are
-  rejected before a request is made.
+  rejected before a request is made. Cross-origin redirects do not receive the
+  authorization header.
 - `YANDEX_CALENDAR_CALENDARS` applies to both target calendars and direct event
-  operations (`update`, `respond`, `move`, and `delete`).
+  operations (`update`, `respond`, `move`, and `delete`). Event paths are
+  canonicalized before the allow-list check and the same canonical path is sent;
+  moves validate both the source and destination calendar.
 - Calendar titles, descriptions, locations, and attendee names are untrusted input.
   A capable agent can still act on misleading event content, so use `read` unless
-  the agent and every calendar writer are trusted.
+  the agent and every calendar writer are trusted. Attendees supplied to a tool
+  must be mailbox addresses, while server-provided calendar addresses are preserved
+  for compatible invitation updates. Line breaks are rejected during serialization
+  to prevent CRLF property injection.
 - The action allow-list limits the tools exposed to Hermes; it does not reduce the
   privileges of the Yandex app password itself. Use a dedicated app password and,
   for stronger isolation, a dedicated Yandex account.

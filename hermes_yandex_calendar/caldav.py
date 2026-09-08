@@ -13,7 +13,7 @@ import re
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
-from urllib.parse import quote, unquote, urlsplit
+from urllib.parse import quote, unquote, urlsplit, urlunsplit
 
 import httpx
 from defusedxml import ElementTree as DET
@@ -37,53 +37,73 @@ class CalDAVError(RuntimeError):
     """Raised for transport or protocol failures. The tool layer converts these to JSON."""
 
 
-def _https_origin(url: str) -> tuple[str, int]:
+def _split_url(url: str):
+    if any(ord(char) < 0x21 for char in url):
+        raise CalDAVError("CalDAV URLs must not contain control characters or spaces.")
+    try:
+        return urlsplit(url)
+    except ValueError as exc:
+        raise CalDAVError("Invalid CalDAV URL.") from exc
+
+
+def _origin_error(setting: str | None) -> CalDAVError:
+    label = setting or "CalDAV URLs"
+    return CalDAVError(f"{label} must use a valid HTTPS origin.")
+
+
+def _https_origin(url: str, *, setting: str | None = None) -> tuple[str, int]:
     """Return a canonical HTTPS origin, rejecting unsafe credential destinations."""
-    parsed = urlsplit(url)
+    parsed = _split_url(url)
     try:
         port = parsed.port
     except ValueError as exc:
-        raise CalDAVError("CalDAV URLs must use the configured HTTPS origin.") from exc
-    if (
-        parsed.scheme.lower() != "https"
-        or not parsed.hostname
-        or parsed.username is not None
-        or parsed.password is not None
-        or parsed.query
-        or parsed.fragment
-    ):
-        raise CalDAVError("CalDAV URLs must use the configured HTTPS origin.")
-    return parsed.hostname.lower(), port or 443
+        raise _origin_error(setting) from exc
+    invalid = (
+        parsed.scheme != "https",
+        not parsed.hostname,
+        parsed.username is not None,
+        bool(parsed.query),
+        bool(parsed.fragment),
+    )
+    if any(invalid):
+        raise _origin_error(setting)
+    return parsed.hostname, 443 if port is None else port
 
 
-def _decode_path(path: str) -> str:
-    """Fully decode a path so nested escapes cannot hide a collection change."""
+def _canonical_path(path: str) -> str:
+    """Decode once, validate, and return one wire-safe path representation."""
     if _INVALID_PERCENT_ESCAPE.search(path):
         raise CalDAVError("event_href contains an invalid percent escape.")
-    decoded = path
-    while True:
-        try:
-            next_value = unquote(decoded, errors="strict")
-        except UnicodeDecodeError as exc:
-            raise CalDAVError("event_href contains an invalid percent escape.") from exc
-        if next_value == decoded:
-            if "\\" in decoded:
-                raise CalDAVError("event_href must not contain a backslash.")
-            return decoded
-        decoded = next_value
+    segments = _decode_path_segments(path)
+    _validate_path_segments(segments)
+    return "/".join(quote(segment, safe="@") for segment in segments)
 
 
-def _event_paths(url: str) -> tuple[str, str]:
-    """Return raw and decoded event paths after rejecting collection aliases."""
-    parsed = urlsplit(url)
+def _decode_path_segments(path: str) -> list[str]:
+    try:
+        return [unquote(segment, errors="strict") for segment in path.split("/")]
+    except UnicodeDecodeError as exc:
+        raise CalDAVError("event_href contains an invalid percent escape.") from exc
+
+
+def _validate_path_segments(segments: list[str]) -> None:
+    if any("\\" in segment for segment in segments):
+        raise CalDAVError("event_href must not contain a backslash.")
+    if any(segment in {".", ".."} for segment in segments):
+        raise CalDAVError("event_href must not contain a dot segment.")
+    if any(not segment for segment in segments[1:-1]):
+        raise CalDAVError("event_href must not contain an empty path segment.")
+
+
+def _event_path(url: str) -> str:
+    """Return the canonical path for an event resource."""
+    parsed = _split_url(url)
     if parsed.query or parsed.fragment or not parsed.path:
         raise CalDAVError("event_href must be a CalDAV resource path without query data.")
-    decoded_path = _decode_path(parsed.path)
-    if any(segment in {".", ".."} for segment in decoded_path.split("/")):
-        raise CalDAVError("event_href must not contain a dot segment.")
-    if decoded_path.endswith("/"):
+    path = _canonical_path(parsed.path)
+    if path.endswith("/") or not path.rsplit("/", 1)[-1].lower().endswith(".ics"):
         raise CalDAVError("event_href must identify an event resource, not a collection.")
-    return parsed.path, decoded_path
+    return path
 
 
 @dataclass
@@ -120,6 +140,11 @@ def normalize_email(address: str) -> str:
     if sep and domain in _YANDEX_DOMAIN_ALIASES:
         return f"{local}@yandex.ru"
     return normalized
+
+
+def _account_email(login: str) -> str:
+    login = login.strip()
+    return login if "@" in login else f"{login}@yandex.ru"
 
 
 def _calendar_from_response(response) -> Calendar | None:
@@ -175,7 +200,10 @@ class YandexCalDAVClient:
     ) -> None:
         self.login = login
         self.base_url = base_url.rstrip("/")
-        self._origin = _https_origin(self.base_url)
+        self._origin = _https_origin(self.base_url, setting="YANDEX_CALENDAR_BASE_URL")
+        base = _split_url(self.base_url)
+        self._base_path = _canonical_path(base.path).rstrip("/")
+        self._origin_url = urlunsplit((base.scheme, base.netloc, "", "", ""))
         self._allowed_raw = list(allowed_calendars or [])
         self._allowed = {c.strip().lower() for c in self._allowed_raw if c.strip()}
         self._owns_client = client is None
@@ -205,14 +233,34 @@ class YandexCalDAVClient:
 
     def _url(self, href: str) -> str:
         """Resolve an href without ever sending credentials to another origin."""
-        parsed = urlsplit(href)
+        parsed = _split_url(href)
         if parsed.scheme or parsed.netloc:
             if _https_origin(href) != self._origin:
                 raise CalDAVError("CalDAV URLs must use the configured HTTPS origin.")
-            return href
-        if not href.startswith("/"):
-            href = "/" + href
-        return self.base_url + href
+            return urlunsplit(
+                (
+                    parsed.scheme,
+                    parsed.netloc,
+                    _canonical_path(parsed.path),
+                    parsed.query,
+                    parsed.fragment,
+                )
+            )
+        if parsed.query or parsed.fragment:
+            return (
+                self._origin_url
+                + _canonical_path(parsed.path)
+                + (("?" + parsed.query) if parsed.query else ("#" + parsed.fragment))
+            )
+        path = "/" + parsed.path.lstrip("/")
+        if self._base_path and not (
+            path == self._base_path or path.startswith(self._base_path + "/")
+        ):
+            path = self._base_path + path
+        return self._origin_url + _canonical_path(path)
+
+    def _collection_key(self, href: str) -> str:
+        return _canonical_path(_split_url(self._url(href)).path).rstrip("/") + "/"
 
     def _request(self, method: str, href: str, *, content: str | None = None, headers=None):
         try:
@@ -222,7 +270,7 @@ class YandexCalDAVClient:
                 content=content.encode("utf-8") if content is not None else None,
                 headers=headers,
             )
-        except httpx.HTTPError as exc:
+        except (httpx.HTTPError, ValueError) as exc:
             raise CalDAVError(f"CalDAV request failed: {exc}") from exc
         if resp.status_code in (401, 403):
             raise CalDAVError(
@@ -236,17 +284,19 @@ class YandexCalDAVClient:
         if not event_href:
             raise CalDAVError("event_href is required.")
         resolved = self._url(event_href)
-        raw_path, decoded_path = _event_paths(resolved)
+        path = _event_path(resolved)
+        resolved_parts = _split_url(resolved)
+        resolved = urlunsplit((resolved_parts.scheme, resolved_parts.netloc, path, "", ""))
         if not self._allowed:
             return resolved
 
-        decoded_parent = decoded_path.rsplit("/", 1)[0].rstrip("/") + "/"
-        allowed_paths = {
-            _decode_path(urlsplit(calendar.href).path).rstrip("/") + "/"
-            for calendar in self.list_calendars()
-        }
-        if decoded_parent not in allowed_paths:
-            raise CalDAVError(f"Event {raw_path!r} is not in an allowed calendar.")
+        parent = path.rsplit("/", 1)[0].rstrip("/") + "/"
+        calendars = self.list_calendars()
+        if not calendars:
+            raise CalDAVError(f"No calendars available matching {self._allowed_raw}.")
+        allowed_paths = {self._collection_key(calendar.href) for calendar in calendars}
+        if parent not in allowed_paths:
+            raise CalDAVError(f"Event {path!r} is not in an allowed calendar.")
         return resolved
 
     # -- discovery ----------------------------------------------------------
@@ -422,7 +472,7 @@ class YandexCalDAVClient:
     def _ensure_organizer(self, event: Event) -> None:
         """A meeting with attendees needs an ORGANIZER; default it to the account owner."""
         if event.attendees and event.organizer is None:
-            event.organizer = Attendee(email=self.login)
+            event.organizer = Attendee(email=_account_email(self.login))
 
     def create_event(self, event: Event, *, calendar: str | None = None) -> Event:
         """PUT a new event. Returns the event with its assigned ``href``/``uid``."""
@@ -430,7 +480,7 @@ class YandexCalDAVClient:
             event.uid = f"{uuid.uuid4()}@hermes-yandex-calendar"
         self._ensure_organizer(event)
         collection = self.resolve_calendar_href(calendar).rstrip("/") + "/"
-        href = f"{collection}{quote(event.uid)}.ics"
+        href = f"{collection}{quote(event.uid, safe='')}.ics"
         resp = self._request(
             "PUT",
             href,
@@ -439,7 +489,7 @@ class YandexCalDAVClient:
         )
         if resp.status_code not in (200, 201, 204):
             raise CalDAVError(f"Creating event failed: HTTP {resp.status_code}")
-        event.href = href
+        event.href = _split_url(href).path or href
         return event
 
     def update_event(self, event: Event, event_href: str) -> Event:
@@ -468,7 +518,7 @@ class YandexCalDAVClient:
         event = self.get_event(event_href)
         if event is None:
             raise CalDAVError(f"Event not found: {event_href}")
-        me = normalize_email(self.login)
+        me = normalize_email(_account_email(self.login))
         mine = next((a for a in event.attendees if normalize_email(a.email) == me), None)
         if mine is None:
             raise CalDAVError(
@@ -497,10 +547,10 @@ class YandexCalDAVClient:
             raise CalDAVError("Cannot move an event without a UID.")
         target = self.resolve_calendar_href(target_calendar).rstrip("/") + "/"
         source_collection = event_href.rsplit("/", 1)[0] + "/"
-        if urlsplit(source_collection).path == urlsplit(target).path:
+        if self._collection_key(source_collection) == self._collection_key(target):
             event.href = urlsplit(event_href).path or event_href
             return event  # already in the target calendar; nothing to do
-        href = f"{target}{quote(event.uid)}.ics"
+        href = self._validate_event_href(f"{target}{quote(event.uid, safe='')}.ics")
         resp = self._request(
             "PUT",
             href,
@@ -510,7 +560,7 @@ class YandexCalDAVClient:
         if resp.status_code not in (200, 201, 204):
             raise CalDAVError(f"Moving event failed: HTTP {resp.status_code}")
         self.delete_event(event_href)  # only remove the original once the copy exists
-        event.href = href
+        event.href = _split_url(href).path or href
         return event
 
     def delete_event(self, event_href: str) -> None:

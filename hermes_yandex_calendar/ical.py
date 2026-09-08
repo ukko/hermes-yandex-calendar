@@ -16,7 +16,6 @@ No Hermes imports here so it stays unit-testable in isolation.
 
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime
 
@@ -29,12 +28,6 @@ __all__ = ["Attendee", "Event", "build_calendar", "parse_events"]
 
 TRANSP_BUSY = "OPAQUE"
 TRANSP_FREE = "TRANSPARENT"
-
-_MAILBOX_ATOM = r"[A-Za-z0-9!#$'*+\-=^_`{|}~]+"
-_MAILBOX_LABEL = r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?"
-_MAILBOX = re.compile(
-    rf"{_MAILBOX_ATOM}(?:\.{_MAILBOX_ATOM})*@{_MAILBOX_LABEL}(?:\.{_MAILBOX_LABEL})*"
-)
 
 
 @dataclass
@@ -125,8 +118,24 @@ def _escape(value: str) -> str:
 
 def _split_prop(line: str) -> tuple[str, dict[str, str], str]:
     """Return (NAME, params, value) for a content line like ``DTSTART;TZID=X:val``."""
-    name_part, _, value = line.partition(":")
-    pieces = name_part.split(";")
+    pieces: list[str] = []
+    chunk: list[str] = []
+    quoted = False
+    value = ""
+    for index, char in enumerate(line):
+        if char == '"':
+            quoted = not quoted
+        if char == ":" and not quoted:
+            pieces.append("".join(chunk))
+            value = line[index + 1 :]
+            break
+        if char == ";" and not quoted:
+            pieces.append("".join(chunk))
+            chunk = []
+        else:
+            chunk.append(char)
+    else:
+        pieces.append("".join(chunk))
     name = pieces[0].upper()
     params: dict[str, str] = {}
     for piece in pieces[1:]:
@@ -162,8 +171,6 @@ def _validate_cal_address(attendee: Attendee) -> None:
     values = (attendee.email, attendee.name, attendee.role, attendee.partstat)
     if any("\r" in value or "\n" in value for value in values):
         raise ValueError("Calendar addresses must not contain a line break.")
-    if _MAILBOX.fullmatch(attendee.email) is None:
-        raise ValueError(f"Invalid calendar email address: {attendee.email!r}.")
 
 
 def _format_cal_address(prop: str, attendee: Attendee) -> str:
@@ -178,7 +185,10 @@ def _format_cal_address(prop: str, attendee: Attendee) -> str:
         parts.append(f"PARTSTAT={_param_value(attendee.partstat)}")
     if attendee.rsvp is not None:
         parts.append(f"RSVP={'TRUE' if attendee.rsvp else 'FALSE'}")
-    return ";".join(parts) + f":mailto:{attendee.email}"
+    address = attendee.email
+    if ":" not in address:
+        address = f"mailto:{address}"
+    return ";".join(parts) + f":{address}"
 
 
 # --- datetime handling -----------------------------------------------------

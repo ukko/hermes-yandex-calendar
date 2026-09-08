@@ -137,6 +137,18 @@ def test_parse_attendees_organizer_transp():
     assert event.attendees[1].rsvp is None
 
 
+def test_parse_quoted_calendar_address_parameters():
+    text = (
+        "BEGIN:VEVENT\r\n"
+        "UID:quoted\r\n"
+        'ATTENDEE;CN="Alice; VP: Sales";PARTSTAT=NEEDS-ACTION:mailto:alice@x.ru\r\n'
+        "END:VEVENT\r\n"
+    )
+    (event,) = parse_events(text)
+    assert event.attendees[0].name == "Alice; VP: Sales"
+    assert event.attendees[0].partstat == "NEEDS-ACTION"
+
+
 def test_build_attendees_roundtrip():
     event = Event(
         uid="m-2",
@@ -181,10 +193,9 @@ def test_build_rejects_line_break_in_calendar_address(attendee):
         "safe@example.com;mailto:other@example.com",
     ],
 )
-def test_build_rejects_invalid_calendar_address(email):
+def test_build_preserves_server_calendar_address(email):
     event = Event(uid="invalid-address", attendees=[Attendee(email=email)])
-    with pytest.raises(ValueError, match="email address"):
-        build_calendar(event)
+    assert email in build_calendar(event)
 
 
 def test_build_normalizes_text_line_breaks_before_escaping():

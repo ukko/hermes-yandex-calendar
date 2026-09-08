@@ -8,6 +8,7 @@ a JSON string, and NEVER raises — every failure path becomes
 from __future__ import annotations
 
 import json
+import re
 from datetime import UTC, date, datetime, timedelta
 from typing import Any
 
@@ -31,6 +32,11 @@ _CALENDAR_HINT = (
 # strict function-calling validators. Handlers still accept objects if a model
 # sends them anyway.
 _ATTENDEE_HINT = "Each entry is an email ('a@x.ru') or a 'Name <a@x.ru>' string."
+_MAILBOX_ATOM = r"[A-Za-z0-9!#$'*+\-=^_`{|}~]+"
+_MAILBOX_LABEL = r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?"
+_MAILBOX = re.compile(
+    rf"{_MAILBOX_ATOM}(?:\.{_MAILBOX_ATOM})*@{_MAILBOX_LABEL}(?:\.{_MAILBOX_LABEL})*"
+)
 
 LIST_CALENDARS_SCHEMA: dict[str, Any] = {
     "name": "yandex_calendar_list_calendars",
@@ -211,20 +217,34 @@ def _parse_attendee(item: Any) -> Attendee:
         email = str(item.get("email", "")).strip()
         if not email:
             raise ValueError("Attendee object is missing 'email'.")
-        return Attendee(
+        attendee = Attendee(
             email=email,
             name=str(item.get("name", "")).strip(),
             role=str(item.get("role", "")).strip(),
             partstat=str(item.get("partstat", "")).strip(),
         )
+        _validate_input_attendee(attendee)
+        return attendee
     text = str(item).strip()
     if "<" in text and ">" in text:
         name = text[: text.index("<")].strip()
         email = text[text.index("<") + 1 : text.index(">")].strip()
-        return Attendee(email=email, name=name)
+        attendee = Attendee(email=email, name=name)
+        _validate_input_attendee(attendee)
+        return attendee
     if not text:
         raise ValueError("Attendee email is empty.")
-    return Attendee(email=text)
+    attendee = Attendee(email=text.removeprefix("mailto:"))
+    _validate_input_attendee(attendee)
+    return attendee
+
+
+def _validate_input_attendee(attendee: Attendee) -> None:
+    values = (attendee.email, attendee.name, attendee.role, attendee.partstat)
+    if any("\r" in value or "\n" in value for value in values):
+        raise ValueError("Calendar addresses must not contain a line break.")
+    if _MAILBOX.fullmatch(attendee.email) is None:
+        raise ValueError(f"Invalid attendee email address: {attendee.email!r}.")
 
 
 def _iso(value: datetime | date | None) -> str | None:
@@ -282,7 +302,7 @@ def handle_list_calendars(args: dict[str, Any], **_kwargs: Any) -> str:
         )
     except MissingCredentials as exc:
         return _error(str(exc))
-    except CalDAVError as exc:
+    except (CalDAVError, ValueError) as exc:
         return _error(str(exc))
     except Exception as exc:
         return _error(f"Unexpected error listing calendars: {exc}")
@@ -445,7 +465,7 @@ def handle_respond(args: dict[str, Any], **_kwargs: Any) -> str:
         return json.dumps({"responded": True, "status": partstat, "event": _event_to_dict(updated)})
     except MissingCredentials as exc:
         return _error(str(exc))
-    except CalDAVError as exc:
+    except (CalDAVError, ValueError) as exc:
         return _error(str(exc))
     except Exception as exc:
         return _error(f"Unexpected error responding to event: {exc}")
@@ -464,7 +484,7 @@ def handle_move(args: dict[str, Any], **_kwargs: Any) -> str:
         return json.dumps({"moved": True, "event": _event_to_dict(moved)})
     except MissingCredentials as exc:
         return _error(str(exc))
-    except CalDAVError as exc:
+    except (CalDAVError, ValueError) as exc:
         return _error(str(exc))
     except Exception as exc:
         return _error(f"Unexpected error moving event: {exc}")
@@ -480,7 +500,7 @@ def handle_delete(args: dict[str, Any], **_kwargs: Any) -> str:
         return json.dumps({"deleted": True, "event_href": href})
     except MissingCredentials as exc:
         return _error(str(exc))
-    except CalDAVError as exc:
+    except (CalDAVError, ValueError) as exc:
         return _error(str(exc))
     except Exception as exc:
         return _error(f"Unexpected error deleting event: {exc}")

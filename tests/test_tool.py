@@ -308,6 +308,33 @@ def test_create_passes_calendar_and_attendees(patch_client):
     assert out["event"]["busy"] is False
 
 
+@pytest.mark.parametrize("email", ["not-an-email", "safe@example.com?subject=bad"])
+def test_create_rejects_invalid_caller_attendee(patch_client, email):
+    patch_client(FakeClient())
+    out = json.loads(
+        tool.handle_create(
+            {"summary": "Meet", "start": "2026-07-25T10:00:00Z", "attendees": [email]}
+        )
+    )
+    assert "Invalid attendee email address" in out["error"]
+
+
+def test_create_normalizes_mailto_attendee(patch_client):
+    fake = FakeClient()
+    patch_client(fake)
+    out = json.loads(
+        tool.handle_create(
+            {
+                "summary": "Meet",
+                "start": "2026-07-25T10:00:00Z",
+                "attendees": ["mailto:safe@example.com"],
+            }
+        )
+    )
+    assert out["created"] is True
+    assert fake.created.attendees[0].email == "safe@example.com"
+
+
 # -- update -----------------------------------------------------------------
 
 
